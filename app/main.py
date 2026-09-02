@@ -7,8 +7,11 @@ for an uptime pinger, and to let you download the CSVs without shell access.
 import io
 import logging
 import os
+import csv
+import fcntl
 import zipfile
 from datetime import datetime, time as dtime
+from pathlib import Path
 
 import requests
 
@@ -31,8 +34,42 @@ log = logging.getLogger("weather")
 
 DIRS = {"1min": MINUTE_DIR, "15min": Q_HOUR_DIR, "1hour": HOUR_DIR}
 
-STATE = {"last_collect": None, "last_aggregate": None, "last_s3_sync": None,
-         "collects": 0, "errors": 0}
+# Status is derived from the files on disk, not from counters in memory. The
+# scheduler and the HTTP handler can run in different processes on Render, and a
+# restart clears memory anyway -- the files are the only thing both sides agree on.
+SYNC_MARKER = DATA_DIR / ".last_s3_sync"
+
+
+def _newest_minute_slot():
+    """Latest minute recorded across today's 1-minute files, and the row count."""
+    latest, rows = None, 0
+    if not MINUTE_DIR.exists():
+        return None, 0
+    for path in MINUTE_DIR.glob(f"*{today_ist()}.csv"):
+        try:
+            with path.open(newline="", encoding="utf-8") as f:
+                site_rows = list(csv.DictReader(f))
+        except OSError:
+            continue
+        rows += len(site_rows)
+        if site_rows:
+            slot = site_rows[-1].get("minute_slot_ist")
+            if slot and (latest is None or slot > latest):
+                latest = slot
+    return latest, rows
+
+
+def _mtime_ist(path):
+    if not Path(path).exists():
+        return None
+    return datetime.fromtimestamp(Path(path).stat().st_mtime, IST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _newest_file_time(directory):
+    if not directory.exists():
+        return None
+    files = list(directory.glob(f"*{today_ist()}.csv"))
+    return _mtime_ist(max(files, key=lambda p: p.stat().st_mtime)) if files else None
 
 
 def _parse_time(value):
@@ -56,20 +93,14 @@ def job_collect():
     if not within_window():
         return
     try:
-        result = collect_once()
-        STATE["last_collect"] = result["minute_slot"]
-        STATE["collects"] += 1
-        if result["failed"]:
-            STATE["errors"] += result["failed"]
+        collect_once()
     except Exception:                       # never let one bad minute kill the scheduler
-        STATE["errors"] += 1
         log.exception("collection failed")
 
 
 def job_aggregate():
     try:
         rebuild()
-        STATE["last_aggregate"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         log.exception("aggregation failed")
 
@@ -78,7 +109,9 @@ def job_s3_sync():
     try:
         result = s3_sync.sync_today()
         if result.get("uploaded"):
-            STATE["last_s3_sync"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+            # Touch a marker so any process can report when the last sync happened.
+            SYNC_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            SYNC_MARKER.write_text(datetime.now(IST).isoformat())
     except Exception:
         log.exception("s3 sync failed")
 
@@ -100,6 +133,7 @@ def create_app():
 
     @app.get("/")
     def status():
+        latest_slot, row_count = _newest_minute_slot()
         counts = {}
         for label, directory in DIRS.items():
             files = sorted(p.name for p in directory.glob("*.csv")) if directory.exists() else []
@@ -111,13 +145,12 @@ def create_app():
             window=f"{COLLECT_START or '00:00'}-{COLLECT_END or '23:59'} IST",
             api_key_configured=bool(API_KEY),
             data_dir=str(DATA_DIR),
-            last_collect_slot=STATE["last_collect"],
-            last_aggregate=STATE["last_aggregate"],
+            last_collect_slot=latest_slot,
+            minute_rows_today=row_count,
+            last_aggregate=_newest_file_time(Q_HOUR_DIR),
             s3_bucket=S3_BUCKET or None,
             keepalive_url=SELF_URL or None,
-            last_s3_sync=STATE["last_s3_sync"],
-            collections_this_boot=STATE["collects"],
-            errors_this_boot=STATE["errors"],
+            last_s3_sync=_mtime_ist(SYNC_MARKER),
             data=counts,
         )
 
@@ -166,8 +199,38 @@ def create_app():
     return app
 
 
+_LOCK_HANDLE = None
+
+
+def _claim_scheduler_lock():
+    """Take an exclusive lock so exactly one process ever runs the scheduler.
+
+    Gunicorn is pinned to one worker, but a module can still be imported more than
+    once (master plus worker, or a reload). Two schedulers would mean two
+    collections a minute. The lock is held for the process lifetime and released
+    by the OS when the process exits, so a crashed process does not wedge it.
+    """
+    global _LOCK_HANDLE
+    lock_path = DATA_DIR / ".scheduler.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _LOCK_HANDLE = handle          # keep a reference; closing would drop the lock
+    return True
+
+
 def start_scheduler():
-    """Start the background jobs. Called once, from the single worker process."""
+    """Start the background jobs in whichever process wins the lock."""
+    if not _claim_scheduler_lock():
+        log.info("scheduler already running in another process (pid %s) -- skipping",
+                 os.getpid())
+        return None
     if not API_KEY:
         log.error("OPENWEATHER_API_KEY is not set -- collection will fail")
 
