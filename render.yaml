@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: openweather-dss-collector
+    runtime: python
+    plan: free             # free instances sleep after 15 min without inbound traffic
+    region: singapore      # closest free region to Mumbai
+    buildCommand: pip install -r requirements.txt
+    # One worker only. A second worker would run a second scheduler and collect
+    # every minute twice.
+    startCommand: gunicorn app.main:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    # No disk: free instances cannot have one, and the filesystem is wiped on every
+    # restart. S3 is the durable copy -- files are restored at boot and pushed
+    # back every few minutes.
+    envVars:
+      - key: OPENWEATHER_API_KEY
+        sync: false        # set in the Render dashboard, never in git
+      - key: S3_BUCKET
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: ap-south-1
+      - key: S3_PREFIX
+        value: openweather-dss
+      - key: S3_SYNC_MINUTES
+        value: "5"
+      - key: DATA_DIR
+        value: /tmp/weather-data   # ephemeral by design; S3 holds the real copy
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      - key: TZ
+        value: Asia/Kolkata
